@@ -1,0 +1,3 @@
+# Keep Unix line endings for the shell script (critical -- CRLF breaks bash)
+gateway-mode text eol=lf
+*.md text eol=lf

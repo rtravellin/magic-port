@@ -1,0 +1,761 @@
+#!/bin/bash
+set -uo pipefail
+#
+# Magic Port
+#
+# Turns a Linux box with two network interfaces into a "magic port" that gives
+# internet access to ANY device plugged into the LAN side — regardless of the
+# device's IP address, subnet, or gateway configuration.
+#
+# A device configured for 10.0.0.172/24 with gateway 10.0.0.1? Works.
+# A device on 172.16.50.5/26 pointing at 172.16.50.1? Also works.
+# A device with a self-assigned 169.254.x.x? Yep.
+# A device set to DHCP with no address at all? Also works.
+#
+# No client-side changes. Just plug in and go.
+#
+# How it works:
+#   1. Assigns /1 routes on the LAN interface (covers all IPv4 space)
+#   2. Enables proxy ARP — answers ARP for ANY IP ("yes, I'm your gateway")
+#   3. Marks + policy-routes LAN traffic out the WAN interface
+#   4. NATs everything via masquerade
+#   5. Redirects DNS queries to a local resolver
+#   6. Serves DHCP on the LAN interface for devices that need an address
+#   7. Optionally connects to WiFi as the WAN uplink
+#
+# This script is designed for a DEDICATED device (e.g. a Raspberry Pi).
+# It takes full control of networking, firewalls, and DNS.
+# Do not run it on a machine that serves other purposes.
+#
+# Requirements:
+#   - Linux with two network interfaces (LAN + WAN)
+#   - WAN interface has internet (DHCP, static, cellular, WiFi, whatever)
+#   - Packages: iptables, dnsmasq, iproute2
+#   - For WiFi: NetworkManager (nmcli)
+#
+# Usage:
+#   sudo gateway-mode on                        # Activate
+#   sudo gateway-mode off                       # Deactivate
+#   sudo gateway-mode status                    # Show current state
+#   sudo gateway-mode wifi list                 # Scan for WiFi networks
+#   sudo gateway-mode wifi "SSID" "passphrase"  # Connect WiFi as WAN
+#   sudo gateway-mode wifi disconnect           # Disconnect WiFi
+#
+
+# --- Configuration -----------------------------------------------------------
+# Set to "auto" to detect interfaces automatically, or hardcode your names.
+# Auto-detect uses WiFi as WAN (if connected) and first ethernet as LAN.
+# LAN_IF = the port you plug devices into
+# WAN_IF = the port with internet access
+LAN_IF="auto"
+WAN_IF="auto"
+
+# IP to restore on LAN_IF when deactivating (optional, set to "" to skip)
+LAN_RESTORE_IP="192.168.1.1/24"
+
+# DHCP range for clients that need an address (e.g. devices set to DHCP)
+# Uses a slice of the 10.255.0.0/24 space — won't conflict with static-IP devices
+DHCP_RANGE_START="10.255.0.100"
+DHCP_RANGE_END="10.255.0.200"
+DHCP_LEASE_TIME="1h"
+
+# DNS servers used for forwarding and resolv.conf fallback
+DNS_PRIMARY="8.8.8.8"
+DNS_SECONDARY="8.8.4.4"
+
+# --- Internal state ----------------------------------------------------------
+STATE_FILE="/var/run/gateway-mode.active"
+GW_DNSMASQ_CONF="/run/dnsmasq-gateway.conf"
+GW_DNSMASQ_PID="/run/dnsmasq-gateway.pid"
+RESOLV_BACKUP="/var/run/resolv.conf.gateway-backup"
+ACTIVATING="no"   # set to "yes" during do_on; triggers cleanup on unexpected exit
+
+# Custom iptables chain names — only our rules, never flushes global state
+CH_FORWARD="MP-FORWARD"
+CH_NAT_POST="MP-NAT-POST"
+CH_NAT_PRE="MP-NAT-PRE"
+CH_MANGLE_PRE="MP-MANGLE-PRE"
+
+# State tracking
+STOPPED_RESOLVED="no"
+DHCPCD_MODIFIED="no"
+RESOLV_BACKED_UP="no"
+
+# --- Safe state file operations ----------------------------------------------
+# Parses key=value pairs without executing arbitrary code (no source/eval)
+load_state() {
+    [[ -f "$STATE_FILE" ]] || return 1
+    LAN_IF=$(sed -n 's/^LAN_IF=//p' "$STATE_FILE")
+    WAN_IF=$(sed -n 's/^WAN_IF=//p' "$STATE_FILE")
+    STOPPED_RESOLVED=$(sed -n 's/^STOPPED_RESOLVED=//p' "$STATE_FILE")
+    DHCPCD_MODIFIED=$(sed -n 's/^DHCPCD_MODIFIED=//p' "$STATE_FILE")
+    RESOLV_BACKED_UP=$(sed -n 's/^RESOLV_BACKED_UP=//p' "$STATE_FILE")
+}
+
+save_state() {
+    cat > "$STATE_FILE" << EOF
+LAN_IF=$LAN_IF
+WAN_IF=$WAN_IF
+STOPPED_RESOLVED=$STOPPED_RESOLVED
+DHCPCD_MODIFIED=${DHCPCD_MODIFIED:-no}
+RESOLV_BACKED_UP=${RESOLV_BACKED_UP:-no}
+EOF
+    chmod 600 "$STATE_FILE"
+}
+
+# --- iptables chain management -----------------------------------------------
+# Uses dedicated chains so teardown never touches rules from other software
+setup_iptables() {
+    # Create custom chains
+    iptables -N "$CH_FORWARD" 2>/dev/null || iptables -F "$CH_FORWARD"
+    iptables -t nat -N "$CH_NAT_POST" 2>/dev/null || iptables -t nat -F "$CH_NAT_POST"
+    iptables -t nat -N "$CH_NAT_PRE" 2>/dev/null || iptables -t nat -F "$CH_NAT_PRE"
+    iptables -t mangle -N "$CH_MANGLE_PRE" 2>/dev/null || iptables -t mangle -F "$CH_MANGLE_PRE"
+
+    # Insert jump rules at the top so they take priority over firewall managers
+    iptables -I FORWARD 1 -j "$CH_FORWARD"
+    iptables -t nat -I POSTROUTING 1 -j "$CH_NAT_POST"
+    iptables -t nat -I PREROUTING 1 -j "$CH_NAT_PRE"
+    iptables -t mangle -I PREROUTING 1 -j "$CH_MANGLE_PRE"
+
+    # Populate custom chains
+    iptables -A "$CH_NAT_POST" -o "$WAN_IF" -j MASQUERADE
+    iptables -A "$CH_NAT_PRE" -i "$LAN_IF" -p udp --dport 53 -j REDIRECT --to-port 53
+    iptables -A "$CH_NAT_PRE" -i "$LAN_IF" -p tcp --dport 53 -j REDIRECT --to-port 53
+    iptables -A "$CH_FORWARD" -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT
+    iptables -A "$CH_FORWARD" -i "$WAN_IF" -o "$LAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    # Mark LAN traffic and route it via WAN (the /1 routes would otherwise
+    # make the kernel try to deliver forwarded traffic on LAN_IF directly)
+    iptables -t mangle -A "$CH_MANGLE_PRE" -i "$LAN_IF" -j MARK --set-mark 1
+}
+
+teardown_iptables() {
+    # Remove jump rules from built-in chains
+    iptables -D FORWARD -j "$CH_FORWARD" 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -j "$CH_NAT_POST" 2>/dev/null || true
+    iptables -t nat -D PREROUTING -j "$CH_NAT_PRE" 2>/dev/null || true
+    iptables -t mangle -D PREROUTING -j "$CH_MANGLE_PRE" 2>/dev/null || true
+
+    # Flush and delete custom chains
+    iptables -F "$CH_FORWARD" 2>/dev/null || true
+    iptables -X "$CH_FORWARD" 2>/dev/null || true
+    iptables -t nat -F "$CH_NAT_POST" 2>/dev/null || true
+    iptables -t nat -X "$CH_NAT_POST" 2>/dev/null || true
+    iptables -t nat -F "$CH_NAT_PRE" 2>/dev/null || true
+    iptables -t nat -X "$CH_NAT_PRE" 2>/dev/null || true
+    iptables -t mangle -F "$CH_MANGLE_PRE" 2>/dev/null || true
+    iptables -t mangle -X "$CH_MANGLE_PRE" 2>/dev/null || true
+}
+
+# --- resolv.conf management -------------------------------------------------
+backup_resolv_conf() {
+    RESOLV_BACKED_UP="no"
+    if [[ -L /etc/resolv.conf ]]; then
+        readlink -f /etc/resolv.conf > "${RESOLV_BACKUP}.link" 2>/dev/null || true
+        RESOLV_BACKED_UP="symlink"
+    elif [[ -f /etc/resolv.conf ]]; then
+        cp /etc/resolv.conf "$RESOLV_BACKUP" 2>/dev/null || true
+        RESOLV_BACKED_UP="file"
+    fi
+}
+
+restore_resolv_conf() {
+    case "${RESOLV_BACKED_UP:-no}" in
+        symlink)
+            if [[ -f "${RESOLV_BACKUP}.link" ]]; then
+                local target
+                target=$(cat "${RESOLV_BACKUP}.link")
+                rm -f /etc/resolv.conf
+                ln -sf "$target" /etc/resolv.conf
+                rm -f "${RESOLV_BACKUP}.link"
+                print_success "Restored resolv.conf symlink → $target"
+            fi
+            ;;
+        file)
+            if [[ -f "$RESOLV_BACKUP" ]]; then
+                cp "$RESOLV_BACKUP" /etc/resolv.conf
+                rm -f "$RESOLV_BACKUP"
+                print_success "Restored resolv.conf from backup"
+            fi
+            ;;
+    esac
+}
+
+# --- Crash recovery ---------------------------------------------------------
+# If the script dies mid-activation (Ctrl+C, power loss, OOM), clean up
+# whatever was partially configured so the system isn't left broken.
+cleanup_on_crash() {
+    [[ "$ACTIVATING" == "yes" ]] || return 0
+    echo ""
+    print_error "Interrupted during activation — rolling back"
+    # Best-effort teardown of anything that may have been set up
+    [[ -f "$GW_DNSMASQ_PID" ]] && kill "$(cat "$GW_DNSMASQ_PID")" 2>/dev/null || true
+    rm -f "$GW_DNSMASQ_PID" "$GW_DNSMASQ_CONF"
+    teardown_iptables
+    ip rule del fwmark 1 table 100 2>/dev/null || true
+    ip route flush table 100 2>/dev/null || true
+    if [[ -n "${LAN_IF:-}" ]] && [[ "$LAN_IF" != "auto" ]]; then
+        echo 0 > /proc/sys/net/ipv4/conf/"$LAN_IF"/proxy_arp 2>/dev/null || true
+        echo 0 > /proc/sys/net/ipv6/conf/"$LAN_IF"/disable_ipv6 2>/dev/null || true
+        ip link set "$LAN_IF" promisc off 2>/dev/null || true
+        ip addr flush dev "$LAN_IF" 2>/dev/null || true
+        [[ -n "$LAN_RESTORE_IP" ]] && ip addr add "$LAN_RESTORE_IP" dev "$LAN_IF" 2>/dev/null || true
+    fi
+    echo 0 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+    [[ "${STOPPED_RESOLVED:-no}" == "yes" ]] && systemctl start systemd-resolved 2>/dev/null || true
+    restore_resolv_conf
+    rm -f "$STATE_FILE"
+    print_error "Rollback complete"
+    exit 1
+}
+trap cleanup_on_crash EXIT INT TERM
+
+# --- Colors ------------------------------------------------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+print_success() { echo -e "${GREEN}✓ $1${NC}"; }
+print_error()   { echo -e "${RED}✗ $1${NC}"; }
+print_warning() { echo -e "${YELLOW}! $1${NC}"; }
+print_info()    { echo -e "${CYAN}  $1${NC}"; }
+
+die() { print_error "$1"; exit 1; }
+
+# Portable IP extraction — avoids grep -oP which requires GNU grep
+extract_ip() {
+    # Extracts first IPv4 address from "inet x.x.x.x/..." lines
+    sed -n 's/.*inet \([0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\).*/\1/p' | head -1
+}
+
+extract_route_dev() {
+    # Extracts device name after "dev" in route output
+    sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1
+}
+
+extract_route_gw() {
+    # Extracts gateway IP after "default via" in route output
+    sed -n 's/.*default via \([0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\).*/\1/p' | head -1
+}
+
+usage() {
+    echo "Usage: gateway-mode {on|off|status|wifi}"
+    echo ""
+    echo "  on                        Activate magic port"
+    echo "  off                       Deactivate and restore LAN interface"
+    echo "  status                    Show current mode"
+    echo "  wifi list                 Scan for WiFi networks"
+    echo "  wifi SSID [passphrase]    Connect to WiFi (becomes WAN)"
+    echo "  wifi disconnect           Disconnect WiFi"
+    exit 1
+}
+
+check_root() {
+    [[ $EUID -eq 0 ]] || die "Must run as root (use sudo)"
+}
+
+ensure_deps() {
+    local missing=()
+    command -v iptables &>/dev/null || missing+=(iptables)
+    command -v dnsmasq &>/dev/null  || missing+=(dnsmasq)
+    command -v ip &>/dev/null       || missing+=(iproute2)
+
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+
+    print_warning "Missing packages: ${missing[*]}"
+    echo "Installing..."
+
+    export DEBIAN_FRONTEND=noninteractive
+    if command -v apt-get &>/dev/null; then
+        # Use dnsmasq-base to get the binary without the auto-starting systemd service
+        local apt_pkgs=()
+        for pkg in "${missing[@]}"; do
+            if [[ "$pkg" == "dnsmasq" ]]; then
+                apt_pkgs+=(dnsmasq-base)
+            else
+                apt_pkgs+=("$pkg")
+            fi
+        done
+        apt-get update -qq && apt-get install -y "${apt_pkgs[@]}" || die "Failed to install: ${apt_pkgs[*]}"
+    elif command -v dnf &>/dev/null; then
+        dnf install -y "${missing[@]}" || die "Failed to install: ${missing[*]}"
+    elif command -v pacman &>/dev/null; then
+        pacman -S --noconfirm "${missing[@]}" || die "Failed to install: ${missing[*]}"
+    elif command -v apk &>/dev/null; then
+        apk add "${missing[@]}" || die "Failed to install: ${missing[*]}"
+    else
+        die "Cannot auto-install: ${missing[*]} — install them manually"
+    fi
+
+    print_success "Installed: ${missing[*]}"
+}
+
+clear_port_53() {
+    # systemd-resolved holds port 53 on Ubuntu/Fedora — must be stopped
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        systemctl stop systemd-resolved
+        STOPPED_RESOLVED="yes"
+        # Back up resolv.conf before modifying it
+        backup_resolv_conf
+        rm -f /etc/resolv.conf
+        printf "nameserver %s\nnameserver %s\n" "$DNS_PRIMARY" "$DNS_SECONDARY" > /etc/resolv.conf
+        print_success "Stopped systemd-resolved (was holding port 53)"
+    fi
+
+    # Stop system dnsmasq service if running
+    if systemctl is-active --quiet dnsmasq 2>/dev/null; then
+        systemctl stop dnsmasq
+        print_success "Stopped system dnsmasq"
+    fi
+
+    # Check for anything else on port 53
+    local pid53 pname53
+    pid53=$(ss -tlnp sport = :53 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1) || true
+    if [[ -n "${pid53:-}" ]]; then
+        pname53=$(ps -p "$pid53" -o comm= 2>/dev/null) || pname53="unknown"
+        print_warning "Process '$pname53' (PID $pid53) is holding port 53"
+        print_warning "Stopping it — dnsmasq needs port 53"
+        kill "$pid53" 2>/dev/null || true
+        sleep 0.5
+        if kill -0 "$pid53" 2>/dev/null; then
+            die "Cannot free port 53 — '$pname53' (PID $pid53) won't stop. Kill it manually."
+        fi
+        print_success "Stopped '$pname53' on port 53"
+    fi
+}
+
+unmanage_lan_if() {
+    # Tell NetworkManager to leave the LAN interface alone
+    if command -v nmcli &>/dev/null; then
+        nmcli dev set "$LAN_IF" managed no 2>/dev/null || true
+        print_success "Told NetworkManager to ignore $LAN_IF"
+    fi
+    # Tell dhcpcd to leave the LAN interface alone (older Pi OS)
+    if command -v dhcpcd &>/dev/null && systemctl is-active --quiet dhcpcd 2>/dev/null; then
+        ip link set "$LAN_IF" down 2>/dev/null || true  # release dhcpcd's hold
+        dhcpcd --release "$LAN_IF" 2>/dev/null || true
+        # Prevent dhcpcd from reclaiming it
+        if ! grep -q "^denyinterfaces $LAN_IF" /etc/dhcpcd.conf 2>/dev/null; then
+            echo "denyinterfaces $LAN_IF" >> /etc/dhcpcd.conf
+            DHCPCD_MODIFIED="yes"
+        fi
+        ip link set "$LAN_IF" up 2>/dev/null || true
+        print_success "Told dhcpcd to ignore $LAN_IF"
+    fi
+}
+
+remanage_lan_if() {
+    # Give the LAN interface back to NetworkManager
+    if command -v nmcli &>/dev/null; then
+        nmcli dev set "$LAN_IF" managed yes 2>/dev/null || true
+    fi
+    # Undo dhcpcd denyinterfaces if we added it
+    if [[ "${DHCPCD_MODIFIED:-no}" == "yes" ]]; then
+        sed -i '/^denyinterfaces '"$LAN_IF"'$/d' /etc/dhcpcd.conf 2>/dev/null || true
+    fi
+}
+
+check_firewall() {
+    # Custom iptables chains are inserted at position 1 in built-in chains,
+    # so they take priority over ufw/firewalld rules. No need to disable
+    # the firewall — our rules coexist with it.
+    if systemctl is-active --quiet ufw 2>/dev/null; then
+        print_info "ufw is active — magic port rules will take priority"
+    fi
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        print_info "firewalld is active — magic port rules will take priority"
+    fi
+}
+
+is_active() {
+    [[ -f "$STATE_FILE" ]]
+}
+
+# --- Interface detection ----------------------------------------------------
+
+detect_wifi_if() {
+    # Returns the first WiFi interface name
+    for dev in /sys/class/net/*/wireless; do
+        [[ -e "$dev" ]] && basename "$(dirname "$dev")" && return
+    done
+    return 1
+}
+
+detect_eth_if() {
+    # Returns the first physical non-WiFi, non-loopback interface
+    for dev in /sys/class/net/*; do
+        local name
+        name=$(basename "$dev")
+        [[ "$name" == "lo" ]] && continue
+        [[ -e "$dev/wireless" ]] && continue
+        [[ -e "$dev/device" ]] || continue   # skip virtual interfaces
+        echo "$name" && return
+    done
+    return 1
+}
+
+resolve_interfaces() {
+    # Resolve "auto" to actual interface names
+    if [[ "$WAN_IF" == "auto" ]]; then
+        local wifi_if
+        wifi_if=$(detect_wifi_if 2>/dev/null) || true
+        if [[ -n "${wifi_if:-}" ]]; then
+            local wifi_ip
+            wifi_ip=$(ip -4 addr show "$wifi_if" 2>/dev/null | extract_ip) || true
+            if [[ -n "${wifi_ip:-}" ]]; then
+                WAN_IF="$wifi_if"
+            else
+                die "WiFi interface $wifi_if has no IP — connect first: gateway-mode wifi SSID PASS"
+            fi
+        else
+            # No WiFi — try to find a second ethernet with a default route
+            local eth_with_gw
+            eth_with_gw=$(ip route show default 2>/dev/null | extract_route_dev) || true
+            if [[ -n "${eth_with_gw:-}" ]]; then
+                WAN_IF="$eth_with_gw"
+            else
+                die "Cannot auto-detect WAN — no WiFi and no default route. Set WAN_IF manually."
+            fi
+        fi
+    fi
+
+    if [[ "$LAN_IF" == "auto" ]]; then
+        local eth_if
+        eth_if=$(detect_eth_if 2>/dev/null) || true
+        # If the first ethernet is already WAN, try the next one
+        if [[ "${eth_if:-}" == "$WAN_IF" ]]; then
+            eth_if=""
+            for dev in /sys/class/net/*; do
+                local name
+                name=$(basename "$dev")
+                [[ "$name" == "lo" ]] && continue
+                [[ -e "$dev/wireless" ]] && continue
+                [[ -e "$dev/device" ]] || continue
+                [[ "$name" == "$WAN_IF" ]] && continue
+                eth_if="$name" && break
+            done
+        fi
+        if [[ -n "${eth_if:-}" ]]; then
+            LAN_IF="$eth_if"
+        else
+            die "Cannot auto-detect LAN — no ethernet interface available. Set LAN_IF manually."
+        fi
+    fi
+}
+
+do_on() {
+    check_root
+    ensure_deps
+    ACTIVATING="yes"
+
+    # Resolve auto-detected interfaces
+    resolve_interfaces
+
+    # Pre-flight checks
+    echo "Pre-flight checks..."
+    print_info "LAN: $LAN_IF  WAN: $WAN_IF"
+
+    ip link show "$LAN_IF" &>/dev/null || die "LAN interface $LAN_IF not found"
+    ip link show "$WAN_IF" &>/dev/null || die "WAN interface $WAN_IF not found"
+
+    local WAN_IP
+    WAN_IP=$(ip -4 addr show "$WAN_IF" 2>/dev/null | extract_ip) || true
+    [[ -n "${WAN_IP:-}" ]] || die "WAN interface $WAN_IF has no IP address"
+    print_success "WAN interface has IP: $WAN_IP"
+
+    if is_active; then
+        print_warning "Magic Port is already active"
+        ACTIVATING="no"
+        exit 0
+    fi
+
+    check_firewall
+    clear_port_53
+    unmanage_lan_if
+
+    print_success "All checks passed"
+    echo ""
+
+    # Step 1: Reconfigure LAN interface with /1 routes (covers all IPv4)
+    echo "Configuring $LAN_IF for magic port routing..."
+    ip addr flush dev "$LAN_IF"
+    ip addr add 10.255.0.1/1 dev "$LAN_IF"
+    ip addr add 128.0.0.1/1 dev "$LAN_IF"
+    print_success "Added 10.255.0.1/1 + 128.0.0.1/1 (covers all IPv4)"
+
+    # Step 2: Enable promiscuous mode + proxy ARP
+    ip link set "$LAN_IF" promisc on
+    echo 1 > /proc/sys/net/ipv4/conf/"$LAN_IF"/proxy_arp
+    if [[ -e /proc/sys/net/ipv4/conf/"$LAN_IF"/proxy_arp_pvlan ]]; then
+        echo 1 > /proc/sys/net/ipv4/conf/"$LAN_IF"/proxy_arp_pvlan
+    fi
+    print_success "Promiscuous mode + proxy ARP enabled"
+
+    # Step 3: Disable IPv6 on LAN to prevent traffic leaks
+    echo 1 > /proc/sys/net/ipv6/conf/"$LAN_IF"/disable_ipv6 2>/dev/null || true
+    print_success "IPv6 disabled on $LAN_IF"
+
+    # Step 4: Enable IP forwarding
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    print_success "IP forwarding enabled"
+
+    # Step 5: Add iptables (custom chains) + policy routing
+    echo "Configuring NAT and routing..."
+    setup_iptables
+    local WAN_GW
+    WAN_GW=$(ip route show default 2>/dev/null | grep "dev $WAN_IF " | extract_route_gw) || true
+    if [[ -z "${WAN_GW:-}" ]]; then
+        # Try the global default route regardless of device
+        WAN_GW=$(ip route show default 2>/dev/null | extract_route_gw) || true
+    fi
+    [[ -n "${WAN_GW:-}" ]] || die "No default gateway found for WAN — is $WAN_IF connected to the internet?"
+    ip route add default via "$WAN_GW" dev "$WAN_IF" table 100
+    ip rule add fwmark 1 table 100
+    print_success "iptables NAT + policy routing + DNS redirect rules added"
+
+    # Step 6: Start dnsmasq for DNS + DHCP (standalone, not systemd)
+    echo "Starting dnsmasq (DNS + DHCP)..."
+    cat > "$GW_DNSMASQ_CONF" << EOF
+# Magic Port config (auto-generated, do not edit)
+interface=$LAN_IF
+no-resolv
+server=$DNS_PRIMARY
+server=$DNS_SECONDARY
+cache-size=1000
+no-hosts
+
+# DHCP for devices that need an address
+dhcp-range=$DHCP_RANGE_START,$DHCP_RANGE_END,$DHCP_LEASE_TIME
+dhcp-option=option:router,10.255.0.1
+dhcp-option=option:dns-server,10.255.0.1
+EOF
+    dnsmasq -C "$GW_DNSMASQ_CONF" -x "$GW_DNSMASQ_PID"
+
+    if [[ -f "$GW_DNSMASQ_PID" ]] && kill -0 "$(cat "$GW_DNSMASQ_PID")" 2>/dev/null; then
+        print_success "dnsmasq started (DNS + DHCP) (PID $(cat "$GW_DNSMASQ_PID"))"
+        print_info "DHCP range: $DHCP_RANGE_START – $DHCP_RANGE_END (lease $DHCP_LEASE_TIME)"
+    else
+        print_error "dnsmasq failed to start — gateway will work but DNS/DHCP won't"
+    fi
+
+    # Step 7: Mark active
+    save_state
+    echo ""
+    print_success "Magic Port ACTIVE"
+    echo ""
+    print_info "Any device on $LAN_IF now has internet access regardless of its IP."
+    print_info "DHCP devices will get an address automatically."
+    print_info "DNS queries to any IP are handled by this server."
+    print_info "Run 'gateway-mode off' when done."
+    ACTIVATING="no"
+}
+
+do_off() {
+    check_root
+
+    if ! is_active; then
+        print_warning "Magic Port is not active"
+        exit 0
+    fi
+
+    # Restore saved state (safe key-value parsing, no code execution)
+    load_state
+
+    # Step 1: Kill standalone gateway dnsmasq
+    echo "Stopping gateway dnsmasq..."
+    if [[ -f "$GW_DNSMASQ_PID" ]]; then
+        kill "$(cat "$GW_DNSMASQ_PID")" 2>/dev/null || true
+        rm -f "$GW_DNSMASQ_PID" "$GW_DNSMASQ_CONF"
+        print_success "Magic Port dnsmasq stopped"
+    else
+        print_warning "No gateway dnsmasq PID file found"
+    fi
+
+    # Step 2: Remove only our iptables chains + policy routing
+    echo "Removing magic port iptables rules..."
+    teardown_iptables
+    ip rule del fwmark 1 table 100 2>/dev/null || true
+    ip route flush table 100 2>/dev/null || true
+    print_success "iptables rules + policy routing removed"
+
+    # Step 3: Disable IP forwarding + proxy ARP
+    echo 0 > /proc/sys/net/ipv4/ip_forward
+    echo 0 > /proc/sys/net/ipv4/conf/"$LAN_IF"/proxy_arp
+    [[ -e /proc/sys/net/ipv4/conf/"$LAN_IF"/proxy_arp_pvlan ]] && \
+        echo 0 > /proc/sys/net/ipv4/conf/"$LAN_IF"/proxy_arp_pvlan
+    print_success "IP forwarding + proxy ARP disabled"
+
+    # Step 4: Re-enable IPv6 on LAN
+    echo 0 > /proc/sys/net/ipv6/conf/"$LAN_IF"/disable_ipv6 2>/dev/null || true
+    print_success "IPv6 re-enabled on $LAN_IF"
+
+    # Step 5: Restore LAN interface
+    echo "Restoring $LAN_IF..."
+    ip link set "$LAN_IF" promisc off
+    ip addr flush dev "$LAN_IF"
+    if [[ -n "$LAN_RESTORE_IP" ]]; then
+        ip addr add "$LAN_RESTORE_IP" dev "$LAN_IF"
+        print_success "$LAN_IF restored to $LAN_RESTORE_IP"
+    else
+        print_success "$LAN_IF flushed (no restore IP configured)"
+    fi
+
+    # Step 6: Return LAN interface to NetworkManager
+    remanage_lan_if
+
+    # Step 7: Restore systemd-resolved if we stopped it
+    if [[ "${STOPPED_RESOLVED:-no}" == "yes" ]]; then
+        restore_resolv_conf
+        systemctl start systemd-resolved 2>/dev/null || true
+        print_success "Restored systemd-resolved"
+    fi
+
+    # Step 8: Remove state marker
+    rm -f "$STATE_FILE"
+    echo ""
+    print_success "Magic Port OFF"
+}
+
+do_status() {
+    # Restore saved state using safe parsing (if active)
+    is_active && load_state
+
+    if is_active; then
+        echo -e "${GREEN}Magic Port: ACTIVE${NC}"
+        echo ""
+
+        echo "LAN interface ($LAN_IF):"
+        ip -4 addr show "$LAN_IF" 2>/dev/null | grep inet | while read -r line; do
+            print_info "$line"
+        done || true
+
+        echo ""
+        echo "IP forwarding:"
+        local FWD
+        FWD=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null) || FWD="0"
+        [[ "$FWD" == "1" ]] && print_info "enabled" || print_warning "disabled"
+
+        echo ""
+        echo "Proxy ARP ($LAN_IF):"
+        local PARP PPVLAN
+        PARP=$(cat /proc/sys/net/ipv4/conf/"$LAN_IF"/proxy_arp 2>/dev/null) || PARP="0"
+        PPVLAN=$(cat /proc/sys/net/ipv4/conf/"$LAN_IF"/proxy_arp_pvlan 2>/dev/null) || PPVLAN="n/a"
+        if [[ "$PARP" == "1" ]]; then
+            [[ "$PPVLAN" == "1" ]] && print_info "enabled (with pvlan)" || print_info "enabled"
+        else
+            print_warning "disabled"
+        fi
+
+        echo ""
+        echo "NAT rules (${CH_NAT_POST}):"
+        iptables -t nat -L "$CH_NAT_POST" -n 2>/dev/null | grep MASQUERADE | while read -r line; do
+            print_info "$line"
+        done || true
+
+        echo ""
+        echo "Magic Port dnsmasq (DNS + DHCP):"
+        if [[ -f "$GW_DNSMASQ_PID" ]] && kill -0 "$(cat "$GW_DNSMASQ_PID")" 2>/dev/null; then
+            print_info "running (PID $(cat "$GW_DNSMASQ_PID"))"
+            print_info "DHCP range: $DHCP_RANGE_START – $DHCP_RANGE_END"
+            local LEASES="/var/lib/misc/dnsmasq.leases"
+            if [[ -f "$LEASES" ]] && [[ -s "$LEASES" ]]; then
+                echo ""
+                echo "Active DHCP leases:"
+                while read -r _ts mac ip host _; do
+                    print_info "$ip  $mac  $host"
+                done < "$LEASES"
+            fi
+        else
+            print_warning "not running"
+        fi
+    else
+        echo -e "${YELLOW}Magic Port: INACTIVE${NC}"
+
+        # Resolve interfaces for display even when inactive
+        if [[ "$LAN_IF" == "auto" ]]; then
+            local eth_if
+            eth_if=$(detect_eth_if 2>/dev/null) || true
+            [[ -n "${eth_if:-}" ]] && LAN_IF="$eth_if"
+        fi
+
+        echo ""
+        echo "LAN interface ($LAN_IF):"
+        ip -4 addr show "$LAN_IF" 2>/dev/null | grep inet | while read -r line; do
+            print_info "$line"
+        done || true
+    fi
+}
+
+do_wifi() {
+    check_root
+    command -v nmcli &>/dev/null || die "nmcli not found — install NetworkManager"
+
+    local subcmd="${1:-}"
+
+    case "$subcmd" in
+        list|scan)
+            local wifi_if
+            wifi_if=$(detect_wifi_if) || die "No WiFi interface found"
+            echo "Scanning for WiFi networks on $wifi_if..."
+            echo ""
+            nmcli dev wifi list ifname "$wifi_if"
+            ;;
+        disconnect)
+            local wifi_if
+            wifi_if=$(detect_wifi_if) || die "No WiFi interface found"
+            nmcli dev disconnect "$wifi_if" 2>/dev/null || true
+            print_success "Disconnected $wifi_if"
+            ;;
+        "")
+            echo "Usage: gateway-mode wifi {list|SSID|disconnect} [passphrase]"
+            exit 1
+            ;;
+        *)
+            # Treat as SSID
+            local ssid="$subcmd"
+            local pass="${2:-}"
+            local wifi_if
+            wifi_if=$(detect_wifi_if) || die "No WiFi interface found"
+
+            # Prompt for password interactively if not provided as argument
+            if [[ -z "$pass" ]] && [[ -t 0 ]]; then
+                read -r -s -p "WiFi passphrase (leave empty for open network): " pass
+                echo ""
+            fi
+
+            echo "Connecting to '$ssid' on $wifi_if..."
+            if [[ -n "$pass" ]]; then
+                nmcli dev wifi connect "$ssid" password "$pass" ifname "$wifi_if" || die "Failed to connect to '$ssid'"
+            else
+                nmcli dev wifi connect "$ssid" ifname "$wifi_if" || die "Failed to connect to '$ssid'"
+            fi
+
+            # Wait for DHCP
+            local wifi_ip="" tries=0
+            while [[ $tries -lt 15 ]]; do
+                wifi_ip=$(ip -4 addr show "$wifi_if" 2>/dev/null | extract_ip) || true
+                [[ -n "${wifi_ip:-}" ]] && break
+                sleep 1
+                ((tries++)) || true
+            done
+
+            if [[ -n "${wifi_ip:-}" ]]; then
+                print_success "Connected to '$ssid' — IP: $wifi_ip"
+                print_info "Run 'gateway-mode on' to activate the gateway"
+            else
+                print_warning "Connected but no IP yet — DHCP may still be negotiating"
+                print_info "Check with: ip addr show $wifi_if"
+            fi
+            ;;
+    esac
+}
+
+case "${1:-}" in
+    on)     do_on ;;
+    off)    ACTIVATING="no"; do_off ;;
+    status) ACTIVATING="no"; do_status ;;
+    wifi)   ACTIVATING="no"; do_wifi "${2:-}" "${3:-}" ;;
+    *)      ACTIVATING="no"; usage ;;
+esac
