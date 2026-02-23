@@ -59,9 +59,10 @@ DHCP_RANGE_START="10.255.0.100"
 DHCP_RANGE_END="10.255.0.200"
 DHCP_LEASE_TIME="1h"
 
-# DNS servers used for forwarding and resolv.conf fallback
-DNS_PRIMARY="8.8.8.8"
-DNS_SECONDARY="8.8.4.4"
+# Upstream DNS for forwarding (Quad9 — privacy-focused, DNSSEC-validating)
+# Alternatives: 1.1.1.1/1.0.0.1 (Cloudflare), 8.8.8.8/8.8.4.4 (Google)
+DNS_PRIMARY="9.9.9.9"
+DNS_SECONDARY="149.112.112.112"
 
 # --- Internal state ----------------------------------------------------------
 STATE_FILE="/var/run/gateway-mode.active"
@@ -75,6 +76,7 @@ CH_FORWARD="MP-FORWARD"
 CH_NAT_POST="MP-NAT-POST"
 CH_NAT_PRE="MP-NAT-PRE"
 CH_MANGLE_PRE="MP-MANGLE-PRE"
+CH_INPUT="MP-INPUT"
 
 # State tracking
 STOPPED_RESOLVED="no"
@@ -108,12 +110,14 @@ EOF
 setup_iptables() {
     # Create custom chains
     iptables -N "$CH_FORWARD" 2>/dev/null || iptables -F "$CH_FORWARD"
+    iptables -N "$CH_INPUT" 2>/dev/null || iptables -F "$CH_INPUT"
     iptables -t nat -N "$CH_NAT_POST" 2>/dev/null || iptables -t nat -F "$CH_NAT_POST"
     iptables -t nat -N "$CH_NAT_PRE" 2>/dev/null || iptables -t nat -F "$CH_NAT_PRE"
     iptables -t mangle -N "$CH_MANGLE_PRE" 2>/dev/null || iptables -t mangle -F "$CH_MANGLE_PRE"
 
     # Insert jump rules at the top so they take priority over firewall managers
     iptables -I FORWARD 1 -j "$CH_FORWARD"
+    iptables -I INPUT 1 -j "$CH_INPUT"
     iptables -t nat -I POSTROUTING 1 -j "$CH_NAT_POST"
     iptables -t nat -I PREROUTING 1 -j "$CH_NAT_PRE"
     iptables -t mangle -I PREROUTING 1 -j "$CH_MANGLE_PRE"
@@ -124,6 +128,13 @@ setup_iptables() {
     iptables -A "$CH_NAT_PRE" -i "$LAN_IF" -p tcp --dport 53 -j REDIRECT --to-port 53
     iptables -A "$CH_FORWARD" -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT
     iptables -A "$CH_FORWARD" -i "$WAN_IF" -o "$LAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+    # Protect the gateway itself — only allow DNS and DHCP from LAN devices
+    iptables -A "$CH_INPUT" -i "$LAN_IF" -p udp --dport 53 -j ACCEPT
+    iptables -A "$CH_INPUT" -i "$LAN_IF" -p tcp --dport 53 -j ACCEPT
+    iptables -A "$CH_INPUT" -i "$LAN_IF" -p udp --dport 67 -j ACCEPT
+    iptables -A "$CH_INPUT" -i "$LAN_IF" -j DROP
+
     # Mark LAN traffic and route it via WAN (the /1 routes would otherwise
     # make the kernel try to deliver forwarded traffic on LAN_IF directly)
     iptables -t mangle -A "$CH_MANGLE_PRE" -i "$LAN_IF" -j MARK --set-mark 1
@@ -132,6 +143,7 @@ setup_iptables() {
 teardown_iptables() {
     # Remove jump rules from built-in chains
     iptables -D FORWARD -j "$CH_FORWARD" 2>/dev/null || true
+    iptables -D INPUT -j "$CH_INPUT" 2>/dev/null || true
     iptables -t nat -D POSTROUTING -j "$CH_NAT_POST" 2>/dev/null || true
     iptables -t nat -D PREROUTING -j "$CH_NAT_PRE" 2>/dev/null || true
     iptables -t mangle -D PREROUTING -j "$CH_MANGLE_PRE" 2>/dev/null || true
@@ -139,6 +151,8 @@ teardown_iptables() {
     # Flush and delete custom chains
     iptables -F "$CH_FORWARD" 2>/dev/null || true
     iptables -X "$CH_FORWARD" 2>/dev/null || true
+    iptables -F "$CH_INPUT" 2>/dev/null || true
+    iptables -X "$CH_INPUT" 2>/dev/null || true
     iptables -t nat -F "$CH_NAT_POST" 2>/dev/null || true
     iptables -t nat -X "$CH_NAT_POST" 2>/dev/null || true
     iptables -t nat -F "$CH_NAT_PRE" 2>/dev/null || true
@@ -197,13 +211,13 @@ cleanup_on_crash() {
     if [[ -n "${LAN_IF:-}" ]] && [[ "$LAN_IF" != "auto" ]]; then
         echo 0 > /proc/sys/net/ipv4/conf/"$LAN_IF"/proxy_arp 2>/dev/null || true
         echo 0 > /proc/sys/net/ipv6/conf/"$LAN_IF"/disable_ipv6 2>/dev/null || true
-        ip link set "$LAN_IF" promisc off 2>/dev/null || true
         ip addr flush dev "$LAN_IF" 2>/dev/null || true
         [[ -n "$LAN_RESTORE_IP" ]] && ip addr add "$LAN_RESTORE_IP" dev "$LAN_IF" 2>/dev/null || true
     fi
     echo 0 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
     [[ "${STOPPED_RESOLVED:-no}" == "yes" ]] && systemctl start systemd-resolved 2>/dev/null || true
     restore_resolv_conf
+    remanage_lan_if
     rm -f "$STATE_FILE"
     print_error "Rollback complete"
     exit 1
@@ -227,17 +241,18 @@ die() { print_error "$1"; exit 1; }
 # Portable IP extraction — avoids grep -oP which requires GNU grep
 extract_ip() {
     # Extracts first IPv4 address from "inet x.x.x.x/..." lines
-    sed -n 's/.*inet \([0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\).*/\1/p' | head -1
+    # || true prevents SIGPIPE exit code from failing under pipefail
+    sed -n 's/.*inet \([0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\).*/\1/p' | head -1 || true
 }
 
 extract_route_dev() {
     # Extracts device name after "dev" in route output
-    sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1
+    sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1 || true
 }
 
 extract_route_gw() {
     # Extracts gateway IP after "default via" in route output
-    sed -n 's/.*default via \([0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\).*/\1/p' | head -1
+    sed -n 's/.*default via \([0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\).*/\1/p' | head -1 || true
 }
 
 usage() {
@@ -485,13 +500,12 @@ do_on() {
     ip addr add 128.0.0.1/1 dev "$LAN_IF"
     print_success "Added 10.255.0.1/1 + 128.0.0.1/1 (covers all IPv4)"
 
-    # Step 2: Enable promiscuous mode + proxy ARP
-    ip link set "$LAN_IF" promisc on
+    # Step 2: Enable proxy ARP
     echo 1 > /proc/sys/net/ipv4/conf/"$LAN_IF"/proxy_arp
     if [[ -e /proc/sys/net/ipv4/conf/"$LAN_IF"/proxy_arp_pvlan ]]; then
         echo 1 > /proc/sys/net/ipv4/conf/"$LAN_IF"/proxy_arp_pvlan
     fi
-    print_success "Promiscuous mode + proxy ARP enabled"
+    print_success "Proxy ARP enabled"
 
     # Step 3: Disable IPv6 on LAN to prevent traffic leaks
     echo 1 > /proc/sys/net/ipv6/conf/"$LAN_IF"/disable_ipv6 2>/dev/null || true
@@ -593,7 +607,6 @@ do_off() {
 
     # Step 5: Restore LAN interface
     echo "Restoring $LAN_IF..."
-    ip link set "$LAN_IF" promisc off
     ip addr flush dev "$LAN_IF"
     if [[ -n "$LAN_RESTORE_IP" ]]; then
         ip addr add "$LAN_RESTORE_IP" dev "$LAN_IF"
@@ -705,6 +718,7 @@ do_wifi() {
         disconnect)
             local wifi_if
             wifi_if=$(detect_wifi_if) || die "No WiFi interface found"
+            nmcli connection delete magic-port-wan 2>/dev/null || true
             nmcli dev disconnect "$wifi_if" 2>/dev/null || true
             print_success "Disconnected $wifi_if"
             ;;
@@ -725,9 +739,41 @@ do_wifi() {
                 echo ""
             fi
 
+            # Remove any previous magic-port-wan connection
+            nmcli connection delete magic-port-wan 2>/dev/null || true
+
             echo "Connecting to '$ssid' on $wifi_if..."
             if [[ -n "$pass" ]]; then
-                nmcli dev wifi connect "$ssid" password "$pass" ifname "$wifi_if" || die "Failed to connect to '$ssid'"
+                # Use a temporary connection file so the passphrase never
+                # appears in the process list (ps aux would show it with
+                # nmcli dev wifi connect ... password "...")
+                local conn_file
+                conn_file=$(mktemp /tmp/mp-wifi-XXXXXX)
+                chmod 600 "$conn_file"
+                cat > "$conn_file" << NMEOF
+[connection]
+id=magic-port-wan
+type=wifi
+interface-name=$wifi_if
+autoconnect=false
+
+[wifi]
+mode=infrastructure
+ssid=$ssid
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=$pass
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+NMEOF
+                nmcli connection load "$conn_file" || { rm -f "$conn_file"; die "Failed to load WiFi profile"; }
+                rm -f "$conn_file"
+                nmcli connection up magic-port-wan || die "Failed to connect to '$ssid'"
             else
                 nmcli dev wifi connect "$ssid" ifname "$wifi_if" || die "Failed to connect to '$ssid'"
             fi

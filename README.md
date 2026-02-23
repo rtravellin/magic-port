@@ -68,6 +68,7 @@ sudo gateway-mode on
 ## Tested On
 
 Raspberry Pi 3 Model B, **Pi OS Lite (64-bit)** (Debian Trixie).
+
 ## What It Handles
 
 The script deals with the stuff that breaks on fresh installs so you don't have to:
@@ -75,7 +76,7 @@ The script deals with the stuff that breaks on fresh installs so you don't have 
 - Auto-installs missing packages (`iptables`, `dnsmasq-base`, `iproute2`)
 - Stops `systemd-resolved` if it's hogging port 53 (restores it on `off`)
 - Tells NetworkManager / dhcpcd to leave the LAN interface alone
-- Disables `ufw` / `firewalld` if they're in the way
+- Coexists with `ufw` / `firewalld` (uses custom chains that take priority)
 - Skips `proxy_arp_pvlan` gracefully if the kernel doesn't support it
 - Portable -- uses `sed` instead of GNU-only `grep -oP`
 
@@ -89,8 +90,8 @@ WAN_IF="auto"          # or "wlan0"
 LAN_RESTORE_IP="192.168.1.1/24"
 DHCP_RANGE_START="10.255.0.100"
 DHCP_RANGE_END="10.255.0.200"
-DNS_PRIMARY="8.8.8.8"  # upstream DNS for forwarding
-DNS_SECONDARY="8.8.4.4"
+DNS_PRIMARY="9.9.9.9"  # upstream DNS (Quad9, DNSSEC-validating)
+DNS_SECONDARY="149.112.112.112"
 ```
 
 Auto-detect picks WiFi as WAN if connected, first ethernet as LAN.
@@ -112,7 +113,7 @@ Auto-detect picks WiFi as WAN if connected, first ethernet as LAN.
 
 ## Alternatives and Why They Don't Work Here
 
-| | |
+| Approach | Why it doesn't work |
 |---|---|
 | **NAT router / travel router** | Only works if the device DHCPs from it. Static IPs? No luck. |
 | **Bridge** | L2 only -- doesn't solve L3 routing. Device still can't reach its gateway. |
