@@ -34,12 +34,12 @@ set -uo pipefail
 #   - For WiFi: NetworkManager (nmcli)
 #
 # Usage:
-#   sudo gateway-mode on                        # Activate
-#   sudo gateway-mode off                       # Deactivate
-#   sudo gateway-mode status                    # Show current state
-#   sudo gateway-mode wifi list                 # Scan for WiFi networks
-#   sudo gateway-mode wifi "SSID" "passphrase"  # Connect WiFi as WAN
-#   sudo gateway-mode wifi disconnect           # Disconnect WiFi
+#   sudo magic-port on                        # Activate
+#   sudo magic-port off                       # Deactivate
+#   sudo magic-port status                    # Show current state
+#   sudo magic-port wifi list                 # Scan for WiFi networks
+#   sudo magic-port wifi "SSID" "passphrase"  # Connect WiFi as WAN
+#   sudo magic-port wifi disconnect           # Disconnect WiFi
 #
 
 # --- Configuration -----------------------------------------------------------
@@ -65,10 +65,10 @@ DNS_PRIMARY="9.9.9.9"
 DNS_SECONDARY="149.112.112.112"
 
 # --- Internal state ----------------------------------------------------------
-STATE_FILE="/var/run/gateway-mode.active"
-GW_DNSMASQ_CONF="/run/dnsmasq-gateway.conf"
-GW_DNSMASQ_PID="/run/dnsmasq-gateway.pid"
-RESOLV_BACKUP="/var/run/resolv.conf.gateway-backup"
+STATE_FILE="/var/run/magic-port.active"
+GW_DNSMASQ_CONF="/run/dnsmasq-magic-port.conf"
+GW_DNSMASQ_PID="/run/dnsmasq-magic-port.pid"
+RESOLV_BACKUP="/var/run/resolv.conf.magic-port-backup"
 ACTIVATING="no"   # set to "yes" during do_on; triggers cleanup on unexpected exit
 
 # Custom iptables chain names — only our rules, never flushes global state
@@ -256,7 +256,7 @@ extract_route_gw() {
 }
 
 usage() {
-    echo "Usage: gateway-mode {on|off|status|wifi}"
+    echo "Usage: magic-port {on|off|status|wifi}"
     echo ""
     echo "  on                        Activate magic port"
     echo "  off                       Deactivate and restore LAN interface"
@@ -422,7 +422,7 @@ resolve_interfaces() {
             if [[ -n "${wifi_ip:-}" ]]; then
                 WAN_IF="$wifi_if"
             else
-                die "WiFi interface $wifi_if has no IP — connect first: gateway-mode wifi SSID PASS"
+                die "WiFi interface $wifi_if has no IP — connect first: magic-port wifi SSID PASS"
             fi
         else
             # No WiFi — try to find a second ethernet with a default route
@@ -562,7 +562,7 @@ EOF
     print_info "Any device on $LAN_IF now has internet access regardless of its IP."
     print_info "DHCP devices will get an address automatically."
     print_info "DNS queries to any IP are handled by this server."
-    print_info "Run 'gateway-mode off' when done."
+    print_info "Run 'magic-port off' when done."
     ACTIVATING="no"
 }
 
@@ -723,7 +723,7 @@ do_wifi() {
             print_success "Disconnected $wifi_if"
             ;;
         "")
-            echo "Usage: gateway-mode wifi {list|SSID|disconnect} [passphrase]"
+            echo "Usage: magic-port wifi {list|SSID|disconnect} [passphrase]"
             exit 1
             ;;
         *)
@@ -789,7 +789,7 @@ NMEOF
 
             if [[ -n "${wifi_ip:-}" ]]; then
                 print_success "Connected to '$ssid' — IP: $wifi_ip"
-                print_info "Run 'gateway-mode on' to activate the gateway"
+                print_info "Run 'magic-port on' to activate the gateway"
             else
                 print_warning "Connected but no IP yet — DHCP may still be negotiating"
                 print_info "Check with: ip addr show $wifi_if"

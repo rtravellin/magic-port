@@ -19,23 +19,23 @@ Normally you'd spend 30 minutes figuring out its IP scheme, reconfiguring your n
 ## Quick Start
 
 ```bash
-sudo cp gateway-mode /usr/local/bin/gateway-mode
-sudo chmod +x /usr/local/bin/gateway-mode
+sudo cp magic-port /usr/local/bin/magic-port
+sudo chmod +x /usr/local/bin/magic-port
 
 # That's it. Dependencies install themselves on first run.
-sudo gateway-mode on
+sudo magic-port on
 
 # Plug in a device. Done.
-sudo gateway-mode status
-sudo gateway-mode off
+sudo magic-port status
+sudo magic-port off
 ```
 
 ### Raspberry Pi (WiFi as WAN)
 
 ```bash
-sudo gateway-mode wifi list
-sudo gateway-mode wifi "MyNetwork"    # prompts for passphrase
-sudo gateway-mode on
+sudo magic-port wifi list
+sudo magic-port wifi "MyNetwork"    # prompts for passphrase
+sudo magic-port on
 # Ethernet port is now the magic port
 ```
 
