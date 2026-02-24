@@ -14,8 +14,6 @@ You've got a device configured for `10.0.0.172/24` pointing at gateway `10.0.0.1
 
 Normally you'd spend 30 minutes figuring out its IP scheme, reconfiguring your network to match, setting up routes... or you just plug it into a Magic Port and it works.
 
-![Before and after](images/before-after.jpg)
-
 ## Quick Start
 
 ```bash
